@@ -1,0 +1,150 @@
+"""
+imu.py — MPU-6050 IMU reader (I2C)
+=====================================
+Reads 3-axis accelerometer and 3-axis gyroscope from an MPU-6050.
+Returns calibrated AccelData and GyroData dataclasses.
+
+Wiring:
+  SDA → GPIO 2 (pin 3)
+  SCL → GPIO 3 (pin 5)
+  VCC → 3.3 V
+  GND → GND
+  AD0 → GND  (I2C address = 0x68)  — pull high for 0x69
+
+Enable I2C:
+  sudo raspi-config → Interface Options → I2C → Enable
+"""
+
+import math
+import struct
+import logging
+import time
+from dataclasses import dataclass
+
+try:
+    import smbus2
+    _SMBUS_AVAILABLE = True
+except ImportError:
+    _SMBUS_AVAILABLE = False
+
+log = logging.getLogger(__name__)
+
+# ── MPU-6050 register map (subset) ───────────────────────────────────────────
+_PWR_MGMT_1   = 0x6B
+_ACCEL_XOUT_H = 0x3B
+_GYRO_XOUT_H  = 0x43
+_ACCEL_CONFIG = 0x1C   # ±2 g  → LSB/g = 16384
+_GYRO_CONFIG  = 0x1B   # ±250 °/s → LSB/°/s = 131
+
+ACCEL_SCALE = 16384.0   # LSB per g  (±2 g range)
+GYRO_SCALE  = 131.0     # LSB per °/s (±250 °/s range)
+G_MS2       = 9.80665   # 1 g in m/s²
+
+
+@dataclass
+class AccelData:
+    x: float   # m/s²
+    y: float
+    z: float
+
+    def magnitude(self) -> float:
+        return math.sqrt(self.x**2 + self.y**2 + self.z**2)
+
+    def roll_deg(self) -> float:
+        """Estimate roll from static accelerometer (no gyro fusion)."""
+        return math.degrees(math.atan2(self.y, self.z))
+
+    def pitch_deg(self) -> float:
+        """Estimate pitch from static accelerometer."""
+        return math.degrees(math.atan2(-self.x,
+                                        math.sqrt(self.y**2 + self.z**2)))
+
+
+@dataclass
+class GyroData:
+    x: float   # °/s
+    y: float
+    z: float
+
+
+class IMUReader:
+    """Read accelerometer and gyroscope from MPU-6050 via I2C."""
+
+    def __init__(self, i2c_bus: int = 1, address: int = 0x68):
+        self._addr = address
+        self._bus  = None
+
+        # Calibration offsets (determined at rest — see calibrate())
+        self._accel_off = [0.0, 0.0, 0.0]
+        self._gyro_off  = [0.0, 0.0, 0.0]
+
+        if _SMBUS_AVAILABLE:
+            self._bus = smbus2.SMBus(i2c_bus)
+            # Wake chip (clear sleep bit)
+            self._bus.write_byte_data(self._addr, _PWR_MGMT_1, 0x00)
+            time.sleep(0.1)
+            log.info("IMUReader: MPU-6050 found at 0x%02X on bus %d",
+                     address, i2c_bus)
+            self.calibrate(samples=200)
+        else:
+            log.warning("IMUReader: smbus2 not available — returning mock data")
+
+    # ── public API ─────────────────────────────────────────────────────────
+
+    def calibrate(self, samples: int = 200):
+        """
+        Average *samples* readings while the kart is stationary.
+        Stores offsets so subsequent reads return zero-biased values.
+        """
+        log.info("IMU calibrating (%d samples) — keep kart still …", samples)
+        ax = ay = az = gx = gy = gz = 0.0
+        for _ in range(samples):
+            a, g = self._read_raw()
+            ax += a[0]; ay += a[1]; az += a[2]
+            gx += g[0]; gy += g[1]; gz += g[2]
+            time.sleep(0.005)
+        n = float(samples)
+        # For accel Z we expect ~1 g when flat, so offset = reading - 1 g
+        self._accel_off = [ax/n, ay/n, (az/n) - G_MS2]
+        self._gyro_off  = [gx/n, gy/n, gz/n]
+        log.info("IMU calibration done. Accel offsets: %s", self._accel_off)
+
+    def read(self) -> tuple[AccelData, GyroData]:
+        """Return calibrated (AccelData, GyroData)."""
+        if self._bus is None:
+            return self._mock_data()
+
+        a, g = self._read_raw()
+        accel = AccelData(
+            x = a[0] - self._accel_off[0],
+            y = a[1] - self._accel_off[1],
+            z = a[2] - self._accel_off[2],
+        )
+        gyro = GyroData(
+            x = g[0] - self._gyro_off[0],
+            y = g[1] - self._gyro_off[1],
+            z = g[2] - self._gyro_off[2],
+        )
+        return accel, gyro
+
+    # ── internal ───────────────────────────────────────────────────────────
+
+    def _read_raw(self) -> tuple[list[float], list[float]]:
+        """Read and convert raw register data."""
+        # Read 14 bytes starting at ACCEL_XOUT_H
+        data = self._bus.read_i2c_block_data(self._addr, _ACCEL_XOUT_H, 14)
+        # Unpack: AX, AY, AZ, TEMP, GX, GY, GZ (each 2 bytes, big-endian signed)
+        vals = struct.unpack(">hhhhhhh", bytes(data))
+        ax, ay, az = [v / ACCEL_SCALE * G_MS2 for v in vals[0:3]]
+        gx, gy, gz = [v / GYRO_SCALE          for v in vals[4:7]]
+        return [ax, ay, az], [gx, gy, gz]
+
+    def _mock_data(self) -> tuple[AccelData, GyroData]:
+        t = time.monotonic()
+        accel = AccelData(
+            x = 0.3 * math.sin(t * 0.5),
+            y = 0.1 * math.cos(t * 0.7),
+            z = G_MS2 + 0.05 * math.sin(t),
+        )
+        gyro = GyroData(x=0.2, y=-0.1, z=0.05)
+        return accel, gyro

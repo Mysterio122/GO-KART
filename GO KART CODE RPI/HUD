@@ -1,0 +1,284 @@
+"""
+hud.py — Go-Kart Heads-Up Display (pygame)
+============================================
+Renders a fullscreen telemetry overlay on the kart's display.
+
+Panel layout:
+  ┌────────────────────────────────────────────┐
+  │  ◄ SPEED ►     ◄ THROTTLE BAR ►   G-FORCE │
+  │  [ MAP TILE — kart dot in centre ]         │
+  │  Heading ↑   Sats: 8   Alt: 30 m   Hz: 99 │
+  └────────────────────────────────────────────┘
+
+Requires pygame and Pillow:
+  pip install pygame pillow
+
+Set DISPLAY=:0 before running if SSH-ing in headlessly:
+  export DISPLAY=:0
+"""
+
+import logging
+import math
+import os
+import threading
+import time
+from typing import Optional
+
+log = logging.getLogger(__name__)
+
+try:
+    import pygame
+    _PYGAME_AVAILABLE = True
+except ImportError:
+    _PYGAME_AVAILABLE = False
+    log.warning("HUD: pygame not available — display disabled")
+
+try:
+    from PIL import Image as PILImage
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
+
+from gps_offline import GPSFix, TILE_DIR, TILE_ZOOM
+from imu import AccelData, GyroData
+
+# ── colour palette ───────────────────────────────────────────────────────────
+BG         = (10,  10,  10)
+ACCENT     = (255,   0,   0)   # red
+GREEN      = ( 50, 220,  80)
+RED        = (220,  50,  50)
+WHITE      = (240, 240, 240)
+GREY       = (100, 100, 100)
+KART_DOT   = (255,  80,  80)
+
+FONT_LARGE = 72
+FONT_MED   = 36
+FONT_SMALL = 22
+
+MAP_TILE_SIZE = 256   # OSM tiles are 256×256 px
+MAP_TILES     = 3     # draw a 3×3 grid of tiles centred on kart
+
+
+class HUD:
+    """
+    Runs a pygame window in a background thread.
+    Call update() from the main loop to push new telemetry.
+    """
+
+    def __init__(self, fullscreen: bool = True, width: int = 1280, height: int = 720):
+        self._fullscreen = fullscreen
+        self._width  = width
+        self._height = height
+        self._lock   = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+        self._running = False
+
+        # Shared telemetry state
+        self._throttle:  float            = 0.0
+        self._accel:     Optional[AccelData] = None
+        self._gyro:      Optional[GyroData]  = None
+        self._gps_fix:   Optional[GPSFix]    = None
+        self._loop_hz:   int              = 0
+
+        # Tile cache: {(zoom, x, y): pygame.Surface}
+        self._tile_cache: dict = {}
+
+    # ── public API ─────────────────────────────────────────────────────────
+
+    def start(self):
+        if not _PYGAME_AVAILABLE:
+            return
+        self._running = True
+        self._thread  = threading.Thread(target=self._run, daemon=True, name="HUD")
+        self._thread.start()
+
+    def update(self, throttle: float, accel: AccelData, gyro: GyroData,
+               gps_fix: Optional[GPSFix], loop_hz: int):
+        with self._lock:
+            self._throttle = throttle
+            self._accel    = accel
+            self._gyro     = gyro
+            self._gps_fix  = gps_fix
+            self._loop_hz  = loop_hz
+
+    def quit(self):
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=2)
+
+    # ── render loop (background thread) ────────────────────────────────────
+
+    def _run(self):
+        os.environ.setdefault("SDL_FBDEV", "/dev/fb0")
+        pygame.init()
+        if self._fullscreen:
+            screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+            self._width, self._height = screen.get_size()
+        else:
+            screen = pygame.display.set_mode((self._width, self._height))
+        pygame.display.set_caption("Go-Kart HUD")
+        pygame.mouse.set_visible(False)
+
+        font_lg = pygame.font.SysFont("dejavusansmono", FONT_LARGE, bold=True)
+        font_md = pygame.font.SysFont("dejavusansmono", FONT_MED, bold=True)
+        font_sm = pygame.font.SysFont("dejavusansmono", FONT_SMALL)
+
+        clock = pygame.time.Clock()
+
+        while self._running:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    self._running = False
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        self._running = False
+
+            screen.fill(BG)
+
+            with self._lock:
+                throttle = self._throttle
+                accel    = self._accel
+                gyro     = self._gyro
+                gps_fix  = self._gps_fix
+                loop_hz  = self._loop_hz
+
+            W, H = self._width, self._height
+
+            # ── speed readout ────────────────────────────────────────────
+            speed_kph = gps_fix.speed_kph if gps_fix and gps_fix.has_fix() else 0.0
+            speed_surf = font_lg.render(f"{speed_kph:05.1f}", True, ACCENT)
+            screen.blit(speed_surf, (30, 20))
+            unit_surf  = font_sm.render("km/h", True, GREY)
+            screen.blit(unit_surf,  (30, 20 + FONT_LARGE + 4))
+
+            # ── throttle bar ─────────────────────────────────────────────
+            bar_x, bar_y = 280, 30
+            bar_w, bar_h = 300, 40
+            pygame.draw.rect(screen, GREY, (bar_x, bar_y, bar_w, bar_h), 2)
+            fill_w = int(bar_w * throttle)
+            colour = GREEN if throttle < 0.7 else RED
+            if fill_w > 0:
+                pygame.draw.rect(screen, colour, (bar_x, bar_y, fill_w, bar_h))
+            thr_lbl = font_sm.render(f"THROTTLE {throttle*100:.0f}%", True, WHITE)
+            screen.blit(thr_lbl, (bar_x, bar_y + bar_h + 4))
+
+            # ── G-force ──────────────────────────────────────────────────
+            if accel:
+                g = accel.magnitude() / 9.80665
+                g_col = RED if g > 2.0 else WHITE
+                g_surf = font_md.render(f"{g:.2f} G", True, g_col)
+                screen.blit(g_surf, (W - 200, 30))
+                roll  = accel.roll_deg()
+                pitch = accel.pitch_deg()
+                r_surf = font_sm.render(f"R:{roll:+.1f}° P:{pitch:+.1f}°", True, GREY)
+                screen.blit(r_surf, (W - 230, 30 + FONT_MED + 6))
+
+            # ── offline map ───────────────────────────────────────────────
+            map_rect = pygame.Rect(30, 120, W - 60, H - 220)
+            pygame.draw.rect(screen, (20, 30, 20), map_rect)
+
+            if gps_fix and gps_fix.has_fix():
+                self._draw_map(screen, map_rect, gps_fix, font_sm)
+            else:
+                no_fix = font_md.render("NO GPS FIX", True, RED)
+                screen.blit(no_fix, (map_rect.centerx - 80, map_rect.centery - 20))
+
+            # ── bottom status bar ─────────────────────────────────────────
+            y_bar = H - 80
+            pygame.draw.line(screen, GREY, (0, y_bar), (W, y_bar), 1)
+
+            sats_txt = f"SATS: {gps_fix.satellites if gps_fix else 0}"
+            alt_txt  = f"ALT: {gps_fix.altitude:.0f} m" if gps_fix else "ALT: —"
+            hdg_txt  = f"HDG: {gps_fix.heading:.0f}°"  if gps_fix else "HDG: —"
+            hz_txt   = f"LOOP: {loop_hz} Hz"
+
+            for i, txt in enumerate([sats_txt, alt_txt, hdg_txt, hz_txt]):
+                s = font_sm.render(txt, True, GREY)
+                screen.blit(s, (30 + i * 250, y_bar + 12))
+
+            pygame.display.flip()
+            clock.tick(30)   # HUD runs at 30 fps — independent of control loop
+
+        pygame.quit()
+
+    # ── map rendering ──────────────────────────────────────────────────────
+
+    def _draw_map(self, screen, rect: "pygame.Rect", fix: GPSFix, font):
+        """Draw a 3×3 grid of OSM tiles centred on the kart's position."""
+        cx, cy = rect.centerx, rect.centery
+        tx, ty = fix.to_tile(TILE_ZOOM)
+        px, py = fix.pixel_offset_in_tile(TILE_ZOOM)
+
+        # Draw MAP_TILES×MAP_TILES grid around centre tile
+        half = MAP_TILES // 2
+        for dx in range(-half, half + 1):
+            for dy in range(-half, half + 1):
+                tile_x, tile_y = tx + dx, ty + dy
+                tile_surf = self._load_tile(tile_x, tile_y, TILE_ZOOM)
+
+                # Pixel offset of this tile's top-left relative to kart centre
+                blit_x = cx + dx * MAP_TILE_SIZE - int(px)
+                blit_y = cy + dy * MAP_TILE_SIZE - int(py)
+
+                # Clip to map_rect
+                src_rect = pygame.Rect(0, 0, MAP_TILE_SIZE, MAP_TILE_SIZE)
+                if tile_surf:
+                    clip_x = max(0, rect.left - blit_x)
+                    clip_y = max(0, rect.top  - blit_y)
+                    src_rect.x += clip_x
+                    src_rect.y += clip_y
+                    src_rect.width  = min(MAP_TILE_SIZE - clip_x,
+                                          rect.right  - max(blit_x, rect.left))
+                    src_rect.height = min(MAP_TILE_SIZE - clip_y,
+                                          rect.bottom - max(blit_y, rect.top))
+                    if src_rect.width > 0 and src_rect.height > 0:
+                        screen.blit(tile_surf, (blit_x + clip_x, blit_y + clip_y),
+                                    src_rect)
+                else:
+                    # Draw placeholder grid square
+                    r = pygame.Rect(blit_x, blit_y,
+                                    MAP_TILE_SIZE, MAP_TILE_SIZE)
+                    r = r.clip(rect)
+                    if r.width > 0 and r.height > 0:
+                        pygame.draw.rect(screen, (30, 40, 30), r)
+                        lbl = font.render(f"{TILE_ZOOM}/{tile_x}/{tile_y}",
+                                          True, GREY)
+                        screen.blit(lbl, (blit_x + 4, blit_y + 4))
+
+        # Draw kart dot at exact centre
+        pygame.draw.circle(screen, KART_DOT, (cx, cy), 8)
+        pygame.draw.circle(screen, WHITE,    (cx, cy), 8, 2)
+
+        # Draw heading arrow
+        hdg_r = math.radians(fix.heading - 90)   # 0° = North = up
+        arrow_len = 20
+        tip_x = cx + int(arrow_len * math.cos(hdg_r))
+        tip_y = cy + int(arrow_len * math.sin(hdg_r))
+        pygame.draw.line(screen, ACCENT, (cx, cy), (tip_x, tip_y), 3)
+
+    def _load_tile(self, x: int, y: int, zoom: int) -> Optional["pygame.Surface"]:
+        key = (zoom, x, y)
+        if key in self._tile_cache:
+            return self._tile_cache[key]
+
+        path = os.path.join(TILE_DIR, str(zoom), str(x), f"{y}.png")
+        if not os.path.exists(path):
+            self._tile_cache[key] = None
+            return None
+
+        try:
+            if _PIL_AVAILABLE:
+                pil_img = PILImage.open(path).convert("RGB")
+                mode    = pil_img.mode
+                size    = pil_img.size
+                data    = pil_img.tobytes()
+                surf    = pygame.image.fromstring(data, size, mode)
+            else:
+                surf = pygame.image.load(path)
+            surf = pygame.transform.scale(surf, (MAP_TILE_SIZE, MAP_TILE_SIZE))
+            self._tile_cache[key] = surf
+            return surf
+        except Exception as e:
+            log.debug("Tile load failed %s: %s", path, e)
+            self._tile_cache[key] = None
+            return None

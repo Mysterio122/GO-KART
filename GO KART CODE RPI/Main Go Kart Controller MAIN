@@ -1,0 +1,110 @@
+"""
+Go-Kart Raspberry Pi Controller
+================================
+Entry point — starts all subsystems and runs the main control loop.
+
+Hardware assumed:
+  - Accelerator pedal  : 0–3.3 V analog → MCP3008 ADC (SPI, CH0)
+  - SparkMAX motor ctrl: PWM on GPIO 18 (hardware PWM, 50 Hz)
+  - MPU-6050 IMU       : I2C bus 1 (0x68)
+  - GPS module         : UART /dev/ttyAMA0, 9600 baud
+  - HUD display        : HDMI / DSI (pygame fullscreen on :0)
+"""
+
+import time
+import signal
+import sys
+import logging
+
+from pedal import PedalReader
+from motor import SparkMaxPWM
+from imu import IMUReader
+from gps_offline import GPSReader
+from hud import HUD
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+log = logging.getLogger("main")
+
+# ── tuneable constants ────────────────────────────────────────────────────────
+LOOP_HZ          = 100          # main control loop rate
+DEADBAND         = 0.03         # ignore pedal < 3 % (noise floor)
+MAX_THROTTLE     = 1.0          # 0.0–1.0 scale sent to motor
+REGEN_BRAKE      = False        # set True if SparkMAX firmware supports regen
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def main():
+    log.info("Initialising go-kart controller …")
+
+    pedal  = PedalReader(spi_channel=0)
+    motor  = SparkMaxPWM(gpio_pin=18)
+    imu    = IMUReader(i2c_bus=1, address=0x68)
+    gps    = GPSReader(port="/dev/ttyAMA0", baud=9600)
+    hud    = HUD()
+
+    # Graceful shutdown on Ctrl-C or SIGTERM
+    def shutdown(sig, frame):
+        log.info("Shutting down …")
+        motor.set_throttle(0.0)
+        motor.cleanup()
+        gps.stop()
+        hud.quit()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT,  shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    gps.start()          # GPS runs in its own background thread
+    hud.start()          # HUD runs in its own background thread
+    motor.arm()          # send neutral pulse so ESC arms
+
+    log.info("Control loop running at %d Hz", LOOP_HZ)
+    dt = 1.0 / LOOP_HZ
+
+    while True:
+        t0 = time.monotonic()
+
+        # ── 1. read sensors ──────────────────────────────────────────────────
+        raw_pedal   = pedal.read_normalised()          # 0.0 – 1.0
+        accel, gyro = imu.read()                       # m/s², deg/s
+        gps_fix     = gps.latest_fix()                 # GPSFix dataclass | None
+
+        # ── 2. apply deadband & scale throttle ──────────────────────────────
+        if raw_pedal < DEADBAND:
+            throttle = 0.0
+        else:
+            # re-map so deadband edge = 0 and full pedal = MAX_THROTTLE
+            throttle = ((raw_pedal - DEADBAND) / (1.0 - DEADBAND)) * MAX_THROTTLE
+
+        # ── 3. safety guard — cut throttle if IMU detects a tip / roll ──────
+        roll_deg = accel.roll_deg()
+        if abs(roll_deg) > 30:
+            throttle = 0.0
+            log.warning("Roll safety cut (%.1f°)", roll_deg)
+
+        # ── 4. send to SparkMAX ──────────────────────────────────────────────
+        motor.set_throttle(throttle)
+
+        # ── 5. push telemetry to HUD ─────────────────────────────────────────
+        hud.update(
+            throttle  = throttle,
+            accel     = accel,
+            gyro      = gyro,
+            gps_fix   = gps_fix,
+            loop_hz   = round(1.0 / max(dt, 1e-6)),
+        )
+
+        # ── 6. pace the loop ─────────────────────────────────────────────────
+        elapsed = time.monotonic() - t0
+        sleep_t = dt - elapsed
+        if sleep_t > 0:
+            time.sleep(sleep_t)
+        else:
+            log.debug("Loop overrun by %.3f ms", -sleep_t * 1000)
+
+
+if __name__ == "__main__":
+    main()

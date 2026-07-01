@@ -1,0 +1,108 @@
+"""
+motor.py — REV SparkMAX PWM interface
+=======================================
+The SparkMAX in PWM mode expects a standard RC servo pulse:
+  1000 µs → full reverse  (or brake if in brake mode)
+  1500 µs → neutral       (motor stopped / ESC arm pulse)
+  2000 µs → full forward
+
+We use pigpio for hardware-accurate pulse widths, because RPi.GPIO
+software PWM jitter can confuse the SparkMAX arming sequence.
+
+Install pigpio:
+  sudo apt install pigpio python3-pigpio
+  sudo systemctl enable --now pigpiod
+
+Wiring:
+  GPIO 18 (pin 12) → SparkMAX PWM signal wire (white / yellow)
+  GND              → SparkMAX PWM ground      (black)
+  (SparkMAX power supply is separate — 12 V battery)
+
+IMPORTANT — SparkMAX CAN vs PWM jumper:
+  Make sure the mode jumper on the SparkMAX is set to PWM mode
+  (or the CAN ID is not configured), otherwise the PWM signal
+  is ignored. This code targets the PWM input only.
+"""
+
+import logging
+import time
+
+try:
+    import pigpio
+    _PIGPIO_AVAILABLE = True
+except ImportError:
+    _PIGPIO_AVAILABLE = False
+
+log = logging.getLogger(__name__)
+
+# PWM pulse widths in microseconds
+PW_NEUTRAL = 1500
+PW_FULL_FWD = 2000
+PW_FULL_REV = 1000
+PWM_FREQ_HZ = 50       # SparkMAX expects 50 Hz (20 ms period)
+
+
+class SparkMaxPWM:
+    """Control a REV SparkMAX via hardware PWM from a Raspberry Pi GPIO pin."""
+
+    def __init__(self, gpio_pin: int = 18):
+        self._pin = gpio_pin
+        self._current_pw = PW_NEUTRAL
+
+        if _PIGPIO_AVAILABLE:
+            self._pi = pigpio.pi()
+            if not self._pi.connected:
+                raise RuntimeError(
+                    "Cannot connect to pigpiod — run: sudo systemctl start pigpiod"
+                )
+            self._pi.set_servo_pulsewidth(self._pin, PW_NEUTRAL)
+            log.info("SparkMaxPWM: pigpio connected, GPIO %d", gpio_pin)
+        else:
+            self._pi = None
+            log.warning("SparkMaxPWM: pigpio not available — motor output disabled")
+
+    # ── public API ─────────────────────────────────────────────────────────
+
+    def arm(self):
+        """
+        Send the neutral pulse for ≥2 s so the SparkMAX completes its
+        arming sequence.  Call once at startup before commanding throttle.
+        """
+        log.info("SparkMAX arming (neutral for 2 s) …")
+        self._send_pw(PW_NEUTRAL)
+        time.sleep(2.0)
+        log.info("SparkMAX armed")
+
+    def set_throttle(self, value: float):
+        """
+        Set motor throttle.
+          value = 0.0  → neutral (stopped)
+          value = 1.0  → full forward
+          value = -1.0 → full reverse  (set to 0 if you don't want reverse)
+        """
+        value = max(-1.0, min(1.0, value))
+        if value >= 0:
+            pw = int(PW_NEUTRAL + value * (PW_FULL_FWD - PW_NEUTRAL))
+        else:
+            pw = int(PW_NEUTRAL + value * (PW_NEUTRAL - PW_FULL_REV))
+        self._send_pw(pw)
+
+    def set_brake(self):
+        """Send a hard-brake pulse (< neutral, SparkMAX brake mode)."""
+        self._send_pw(PW_FULL_REV)
+
+    def cleanup(self):
+        """Stop PWM output safely."""
+        self._send_pw(PW_NEUTRAL)
+        if self._pi:
+            self._pi.set_servo_pulsewidth(self._pin, 0)  # disable PWM
+            self._pi.stop()
+
+    # ── internal ───────────────────────────────────────────────────────────
+
+    def _send_pw(self, pulse_width_us: int):
+        self._current_pw = pulse_width_us
+        if self._pi:
+            self._pi.set_servo_pulsewidth(self._pin, pulse_width_us)
+        else:
+            log.debug("MOCK PWM → %d µs", pulse_width_us)

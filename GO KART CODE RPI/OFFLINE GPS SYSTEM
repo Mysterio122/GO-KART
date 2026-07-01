@@ -1,0 +1,294 @@
+"""
+gps_offline.py — Offline GPS reader
+======================================
+Parses NMEA sentences from a UART GPS module (e.g. u-blox NEO-6M/7M/8M)
+and optionally overlays the position on locally-stored map tiles (OpenStreetMap
+slippy-tile format, downloaded in advance with the tile_downloader helper).
+
+Hardware:
+  GPS TX → GPIO 15 (RXD, pin 10)
+  GPS RX → GPIO 14 (TXD, pin 8)   ← only needed if sending commands
+  VCC    → 3.3 V or 5 V (check your module)
+  GND    → GND
+
+Enable UART:
+  sudo raspi-config → Interface Options → Serial Port
+    - Login shell over serial: No
+    - Serial port hardware: Yes
+  Reboot, then the port appears as /dev/ttyAMA0 (Pi 3/4) or /dev/ttyS0
+
+Offline map tiles:
+  Run  python gps_offline.py --download-tiles  to fetch tiles for your area.
+  Tiles are saved to  ~/gokart_tiles/  in OSM slippy format:
+    {zoom}/{x}/{y}.png
+  Once downloaded the system works with NO internet connection.
+
+GPSFix dataclass is imported by hud.py and main.py.
+"""
+
+import logging
+import math
+import os
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Optional
+
+try:
+    import serial
+    _SERIAL_AVAILABLE = True
+except ImportError:
+    _SERIAL_AVAILABLE = False
+
+log = logging.getLogger(__name__)
+
+TILE_DIR  = os.path.expanduser("~/gokart_tiles")
+TILE_ZOOM = 16      # zoom level for tile downloads (16 = ~2.4 m/px, good for kart)
+
+
+# ── Data classes ─────────────────────────────────────────────────────────────
+
+@dataclass
+class GPSFix:
+    lat:       float = 0.0      # decimal degrees, N positive
+    lon:       float = 0.0      # decimal degrees, E positive
+    speed_kph: float = 0.0      # km/h
+    heading:   float = 0.0      # degrees true (0 = North)
+    altitude:  float = 0.0      # metres above MSL
+    satellites: int  = 0
+    fix_quality: int = 0        # 0=no fix, 1=GPS, 2=DGPS
+    timestamp: float = field(default_factory=time.time)
+
+    def has_fix(self) -> bool:
+        return self.fix_quality > 0 and self.satellites >= 3
+
+    def to_tile(self, zoom: int = TILE_ZOOM) -> tuple[int, int]:
+        """Convert lat/lon to OSM tile (x, y) at the given zoom level."""
+        lat_r = math.radians(self.lat)
+        n = 2 ** zoom
+        x = int((self.lon + 180.0) / 360.0 * n)
+        y = int((1.0 - math.asinh(math.tan(lat_r)) / math.pi) / 2.0 * n)
+        return x, y
+
+    def pixel_offset_in_tile(self, zoom: int = TILE_ZOOM) -> tuple[float, float]:
+        """
+        Return the sub-tile pixel offset (0–255, 0–255) within the tile
+        returned by to_tile(), so the HUD can draw the kart dot precisely.
+        """
+        lat_r = math.radians(self.lat)
+        n = 2 ** zoom
+        tx = (self.lon + 180.0) / 360.0 * n
+        ty = (1.0 - math.asinh(math.tan(lat_r)) / math.pi) / 2.0 * n
+        px = (tx - int(tx)) * 256
+        py = (ty - int(ty)) * 256
+        return px, py
+
+
+# ── NMEA parser ──────────────────────────────────────────────────────────────
+
+def _parse_lat(raw: str, hem: str) -> float:
+    if not raw:
+        return 0.0
+    deg  = float(raw[:2])
+    mins = float(raw[2:])
+    val  = deg + mins / 60.0
+    return -val if hem == "S" else val
+
+
+def _parse_lon(raw: str, hem: str) -> float:
+    if not raw:
+        return 0.0
+    deg  = float(raw[:3])
+    mins = float(raw[3:])
+    val  = deg + mins / 60.0
+    return -val if hem == "W" else val
+
+
+def _nmea_checksum_ok(sentence: str) -> bool:
+    try:
+        body, cs = sentence[1:].split("*")
+        calc = 0
+        for c in body:
+            calc ^= ord(c)
+        return calc == int(cs.strip(), 16)
+    except Exception:
+        return False
+
+
+def parse_gga(parts: list[str], fix: GPSFix) -> None:
+    """$GPGGA — fix data (position, altitude, satellites)."""
+    try:
+        fix.lat         = _parse_lat(parts[2], parts[3])
+        fix.lon         = _parse_lon(parts[4], parts[5])
+        fix.fix_quality = int(parts[6]) if parts[6] else 0
+        fix.satellites  = int(parts[7]) if parts[7] else 0
+        fix.altitude    = float(parts[9]) if parts[9] else 0.0
+    except (IndexError, ValueError):
+        pass
+
+
+def parse_rmc(parts: list[str], fix: GPSFix) -> None:
+    """$GPRMC — recommended minimum (speed, heading)."""
+    try:
+        if parts[2] == "A":   # Active = valid fix
+            fix.lat       = _parse_lat(parts[3], parts[4])
+            fix.lon       = _parse_lon(parts[5], parts[6])
+            knots         = float(parts[7]) if parts[7] else 0.0
+            fix.speed_kph = knots * 1.852
+            fix.heading   = float(parts[8]) if parts[8] else 0.0
+    except (IndexError, ValueError):
+        pass
+
+
+# ── GPS reader (runs in background thread) ───────────────────────────────────
+
+class GPSReader:
+    """
+    Background thread that reads NMEA sentences from a serial GPS module
+    and exposes the latest fix via latest_fix().
+    """
+
+    def __init__(self, port: str = "/dev/ttyAMA0", baud: int = 9600):
+        self._port = port
+        self._baud = baud
+        self._fix  = GPSFix()
+        self._lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True, name="GPS")
+        self._thread.start()
+        log.info("GPSReader: thread started on %s @ %d baud", self._port, self._baud)
+
+    def stop(self):
+        self._stop_event.set()
+
+    def latest_fix(self) -> GPSFix:
+        with self._lock:
+            import copy
+            return copy.copy(self._fix)
+
+    # ── background thread ──────────────────────────────────────────────────
+
+    def _run(self):
+        if not _SERIAL_AVAILABLE:
+            log.warning("GPSReader: pyserial not available — generating mock data")
+            self._mock_loop()
+            return
+
+        while not self._stop_event.is_set():
+            try:
+                with serial.Serial(self._port, self._baud, timeout=1) as ser:
+                    log.info("GPSReader: serial port open")
+                    while not self._stop_event.is_set():
+                        line = ser.readline().decode("ascii", errors="ignore").strip()
+                        self._process_line(line)
+            except serial.SerialException as e:
+                log.error("GPS serial error: %s — retrying in 3 s", e)
+                time.sleep(3)
+
+    def _process_line(self, line: str):
+        if not line.startswith("$") or "*" not in line:
+            return
+        if not _nmea_checksum_ok(line):
+            return
+        parts = line.split(",")
+        tag   = parts[0][1:]   # strip $
+        with self._lock:
+            if tag in ("GPGGA", "GNGGA"):
+                parse_gga(parts, self._fix)
+                self._fix.timestamp = time.time()
+            elif tag in ("GPRMC", "GNRMC"):
+                parse_rmc(parts, self._fix)
+                self._fix.timestamp = time.time()
+
+    def _mock_loop(self):
+        """Simulate driving in a small loop for testing without hardware."""
+        lat0, lon0, r = 33.8125, -117.9195, 0.0003   # near Cypress, CA
+        t = 0.0
+        while not self._stop_event.is_set():
+            with self._lock:
+                self._fix = GPSFix(
+                    lat        = lat0 + r * math.sin(t),
+                    lon        = lon0 + r * math.cos(t),
+                    speed_kph  = 25.0 + 5.0 * math.sin(t * 0.3),
+                    heading    = (math.degrees(t) % 360),
+                    altitude   = 30.0,
+                    satellites = 8,
+                    fix_quality = 1,
+                    timestamp  = time.time(),
+                )
+            t += 0.05
+            time.sleep(0.1)
+
+
+# ── Tile downloader (run once to cache offline tiles) ────────────────────────
+
+def download_tiles(lat: float, lon: float,
+                   radius_km: float = 1.0,
+                   zoom: int = TILE_ZOOM):
+    """
+    Download OSM tiles covering a circle of *radius_km* around lat/lon.
+    Saves tiles to TILE_DIR.  Run once with internet, then go offline.
+
+    Usage:
+        python gps_offline.py --download-tiles 33.8125 -117.9195 1.5
+    """
+    try:
+        import urllib.request
+    except ImportError:
+        print("urllib not available")
+        return
+
+    os.makedirs(TILE_DIR, exist_ok=True)
+
+    # Bounding box in degrees (~1 deg lat = 111 km)
+    delta_lat = radius_km / 111.0
+    delta_lon = radius_km / (111.0 * math.cos(math.radians(lat)))
+
+    n = 2 ** zoom
+    def deg2tile(la, lo):
+        x = int((lo + 180.0) / 360.0 * n)
+        y = int((1.0 - math.asinh(math.tan(math.radians(la))) / math.pi) / 2.0 * n)
+        return x, y
+
+    x_min, y_max = deg2tile(lat - delta_lat, lon - delta_lon)
+    x_max, y_min = deg2tile(lat + delta_lat, lon + delta_lon)
+
+    total = (x_max - x_min + 1) * (y_max - y_min + 1)
+    print(f"Downloading {total} tiles (zoom {zoom}) …")
+
+    headers = {"User-Agent": "GoKartController/1.0 (offline cache)"}
+    count = 0
+    for x in range(x_min, x_max + 1):
+        for y in range(y_min, y_max + 1):
+            dest = os.path.join(TILE_DIR, str(zoom), str(x))
+            os.makedirs(dest, exist_ok=True)
+            path = os.path.join(dest, f"{y}.png")
+            if os.path.exists(path):
+                continue
+            url = f"https://tile.openstreetmap.org/{zoom}/{x}/{y}.png"
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    with open(path, "wb") as f:
+                        f.write(r.read())
+                count += 1
+                time.sleep(0.1)   # be polite to OSM tile servers
+            except Exception as e:
+                print(f"  SKIP {url}: {e}")
+
+    print(f"Done — {count} tiles saved to {TILE_DIR}")
+
+
+if __name__ == "__main__":
+    import sys
+    if "--download-tiles" in sys.argv:
+        idx = sys.argv.index("--download-tiles")
+        la  = float(sys.argv[idx + 1]) if len(sys.argv) > idx + 1 else 33.8125
+        lo  = float(sys.argv[idx + 2]) if len(sys.argv) > idx + 2 else -117.9195
+        rad = float(sys.argv[idx + 3]) if len(sys.argv) > idx + 3 else 1.0
+        download_tiles(la, lo, rad)
+    else:
+        print("Usage: python gps_offline.py --download-tiles <lat> <lon> [radius_km]")
