@@ -5,8 +5,8 @@ A Go Kart design with a embedded Rasberry Pi and old FRC parts to power parts of
 So this is the link to my project's hardware, but if you want to access it and see how I actually made it you will need to make a Onshape account.(srry abt that!) ⬇
 https://cad.onshape.com/documents/9b6695b1d4a60c10a7fa9ac2/w/89f098238516000670849f5d/e/6a5bd952239f280b0dcb97d7
 
-This is the link to my github code for the rasberry pi which runs the project.( I did use the help of claude while attempting to code this.)
-
+This is the link to my github code for the Rasberry Pi which runs the project.( I did use the help of claude while attempting to code this.)
+https://github.com/Mysterio122/GO-KART/tree/main/GO%20KART%20CODE%20RPI
 
 + Carries one person in an open cockpit with a seat and a Raspberry Pi heads-up display.
   
