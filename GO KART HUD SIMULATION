@@ -1,4 +1,4 @@
-# Before playing this simulation, make sure to go to your computer terminal and type "pip install pygame"
+# Before playing this simulation, make sure to go to your computer terminal and type "py -m pip install pygame"
 #Open a text editor (like Notepad, TextEdit, VS Code, or Thonny).
 #Copy the entire Python script from the previous message and paste it into the editor.
 #Save the file and name it exactly hud_sim.py.
