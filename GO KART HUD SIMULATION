@@ -1,0 +1,125 @@
+# Before playing this simulation, make sure to go to your computer terminal and type "pip install pygame"
+#Open a text editor (like Notepad, TextEdit, VS Code, or Thonny).
+#Copy the entire Python script from the previous message and paste it into the editor.
+#Save the file and name it exactly hud_sim.py.
+# Go back to your terminal and type "python3 hud_sim.py" or "python hud_sim.py" to run the simulation.
+#How to Control It (The Interactivity)
+#Once the window opens up, click inside it so your computer registers your commands. Now you can play with the metrics using your keyboard:
+# INSTRUCTIONS ARE BELOW 
+#Press and Hold [UP ARROW]: Steps on the accelerator pedal. You will see the green bar at the bottom fill up and the throttle percentage climb to 100%.
+#Release [UP ARROW]: The pedal simulates a physical spring return, automatically dropping the throttle back down to 0%.
+#Press [RIGHT ARROW]: Increases your GPS speed manually so you can watch the large center speedometer change.
+#Press [LEFT ARROW]: Decreases your GPS speed.
+#Press the [G] Key: Toggles your GPS lock status. If you turn it off, the HUD will simulate a lost signal, drop your speed to 0, and turn the status text red—just like a real offline GPS unit when it enters a tunnel!
+
+import pygame
+import sys
+
+# --- CONFIGURATION & INITIALIZATION ---
+pygame.init()
+
+# Set up an 800x480 screen (standard for small Pi touchscreens)
+screen = pygame.display.set_mode((800, 480))
+pygame.display.set_caption("Go-Kart Advanced HUD Simulation")
+clock = pygame.time.Clock()
+
+# UI System Fonts
+FONT_LARGE = pygame.font.Font(None, 150)
+FONT_MED = pygame.font.Font(None, 50)
+FONT_SMALL = pygame.font.Font(None, 30)
+
+# Color Palette (Dark Theme for Racing)
+COLOR_BG = (15, 15, 18)          # Deep charcoal
+COLOR_TEXT = (240, 240, 245)     # Off-white
+COLOR_MUTED = (100, 100, 110)    # Gray for units
+COLOR_GREEN = (0, 210, 106)      # Neon green for throttle
+COLOR_RED = (255, 69, 58)        # Warning red
+COLOR_BAR_BG = (35, 35, 40)      # Background track for progress bar
+
+# Simulated Data Variables
+sim_throttle = 0        # 0% to 100%
+sim_speed = 0           # MPH
+sim_gps_lock = True
+sim_lat = "33.8121"
+sim_lon = "-118.2437"
+
+# --- MAIN LOOP ---
+running = True
+while running:
+    # 1. Handle Simulated Inputs (Keyboard)
+    keys = pygame.key.get_pressed()
+    
+    # Throttle Simulation (Up/Down arrows)
+    if keys[pygame.K_UP]:
+        sim_throttle = min(100, sim_throttle + 2)
+    elif keys[pygame.K_DOWN]:
+        sim_throttle = max(0, sim_throttle - 2)
+    else:
+        # Passive friction decay (pedal springs back automatically)
+        sim_throttle = max(0, sim_throttle - 1)
+
+    # Event Checking
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            running = False
+        if event.type == pygame.KEYDOWN:
+            # Manual Speed Adjustments (Right/Left arrows)
+            if event.key == pygame.K_RIGHT:
+                sim_speed = min(60, sim_speed + 1)
+            if event.key == pygame.K_LEFT:
+                sim_speed = max(0, sim_speed - 1)
+            # Toggle GPS Lock state with 'g' key
+            if event.key == pygame.K_g:
+                sim_gps_lock = not sim_gps_lock
+
+    # 2. RENDER THE INTERFACE
+    screen.fill(COLOR_BG)
+
+    # --- Header Segment (GPS Status) ---
+    if sim_gps_lock:
+        status_text = FONT_SMALL.render("● GPS SIGNAL FIXED", True, COLOR_GREEN)
+        coords_text = FONT_SMALL.render(f"LAT: {sim_lat}  |  LON: {sim_lon}", True, COLOR_MUTED)
+    else:
+        status_text = FONT_SMALL.render("▲ SEARCHING FOR SATELLITES...", True, COLOR_RED)
+        coords_text = FONT_SMALL.render("LAT: --.----  |  LON: --.----", True, COLOR_MUTED)
+        sim_speed = 0  # No GPS means no valid speed tracking
+        
+    screen.blit(status_text, (30, 25))
+    screen.blit(coords_text, (30, 55))
+
+    # --- Center Segment (Digital Speedometer) ---
+    speed_num = FONT_LARGE.render(f"{sim_speed}", True, COLOR_TEXT)
+    speed_unit = FONT_MED.render("MPH", True, COLOR_MUTED)
+    
+    # Position logic to keep text clean and centered
+    speed_num_rect = speed_num.get_rect(center=(400, 200))
+    speed_unit_rect = speed_unit.get_rect(center=(400, 275))
+    
+    screen.blit(speed_num, speed_num_rect)
+    screen.blit(speed_unit, speed_unit_rect)
+
+    # --- Footer Segment (Throttle Level Dynamic Graphic) ---
+    bar_x, bar_y = 100, 390
+    bar_width, bar_height = 600, 35
+    
+    # Calculate current visual layout width based on percentage
+    current_fill_width = int((sim_throttle / 100.0) * bar_width)
+    
+    # Draw Progress Track Container
+    pygame.draw.rect(screen, COLOR_BAR_BG, (bar_x, bar_y, bar_width, bar_height), border_radius=6)
+    # Draw Active Power fill
+    if current_fill_width > 0:
+        pygame.draw.rect(screen, COLOR_GREEN, (bar_x, bar_y, current_fill_width, bar_height), border_radius=6)
+        
+    # Text overlay for throttle metrics
+    throttle_label = FONT_SMALL.render(f"THROTTLE OUTPUT: {sim_throttle}%", True, COLOR_TEXT)
+    screen.blit(throttle_label, (bar_x, bar_y - 30))
+
+    # Update Frame Buffer
+    pygame.display.flip()
+    
+    # Limit runtime performance down to a fixed 30 updates per second
+    clock.tick(30)
+
+pygame.quit()
+sys.exit()
