@@ -8,6 +8,27 @@ https://cad.onshape.com/documents/9b6695b1d4a60c10a7fa9ac2/w/89f0982385160006708
 This is the link to my github code for the Rasberry Pi which runs the project.( I did use the help of claude while attempting to code this.)
 https://github.com/Mysterio122/GO-KART/tree/main/GO%20KART%20CODE%20RPI
 
+This is the GitHub repo to try out the HUD simulation on your very own computer.PLEASE FOLLOW THE INSTRUCTIONS IN THE REPO.(it won't work if you don't do it.)
+https://github.com/Mysterio122/GO-KART/blob/main/GO%20KART%20HUD%20SIMULATION
+
+INSTRUCTIONS:
+The Heads-Up Display is broken down into three main zones:
+1. **Telemetry Header (Top Left):** Shows whether the system has a valid GPS satellite lock and displays live latitude/longitude data.
+2. **Digital Speedometer (Center):** Prominently displays current vehicle velocity in MPH.
+3. **Dynamic Throttle Bar (Bottom):** Features a high-contrast green progress bar representing accelerator depth.
+---
+### Simulation Controls Reference
+To test how the system reacts to driving conditions without actual hardware connected, use this keyboard cheat sheet:
+| Key Action | Go-Kart Action Simulated | HUD Visual Response |
+| :--- | :--- | :--- |
+| Hold [UP ARROW] | Stepping on the gas pedal | Green bar fills up; throttle % climbs to 100% |
+| Release [UP ARROW] | Letting go of the gas pedal | Bar automatically drops to 0% (spring-return) |
+| Press [RIGHT ARROW] | Acceleration / Driving faster | Center speed number increases |
+| Press [LEFT ARROW]| Braking / Slowing down | Center speed number decreases |
+| Press [G] Key| Entering a tunnel / Lost signal | Toggles GPS status from green (FIXED) to red (SEARCHING) |
+
+
+
 + Carries one person in an open cockpit with a seat and a Raspberry Pi heads-up display.
   
 + Uses off-road wheels on a steel chassis that is slightly tapered at both ends.
